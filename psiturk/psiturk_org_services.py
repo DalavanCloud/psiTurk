@@ -14,6 +14,9 @@ from sys import platform as _platform
 from psiturk.psiturk_config import PsiturkConfig
 import psutil
 
+import os, ssl
+
+
 
 class PsiturkOrgServices(object):
     """
@@ -39,7 +42,7 @@ class PsiturkOrgServices(object):
 
     def check_credentials(self):
         ''' Check credentials '''
-        req = requests.get(self.api_server + '/api/ad',
+        req = requests.get(self.api_server + '/api/ad', verify=False,
                            auth=(self.access_key, self.secret_key))
         # Not sure 500 server error should be included here
         if req.status_code in [401, 403, 500]:
@@ -65,6 +68,11 @@ class PsiturkOrgServices(object):
         """
             get_system_status:
         """
+        if (not os.environ.get('PYTHONHTTPSVERIFY', '') and
+        getattr(ssl, '_create_unverified_context', None)): 
+            ssl._create_default_https_context = ssl._create_unverified_context
+
+
         try:
             api_server_status_link = self.api_server + '/status_msg?version=' +\
                 version_number
@@ -75,21 +83,6 @@ class PsiturkOrgServices(object):
                 your internet connection.\nYou will not be able to create new\
                 hits, but testing locally should work.\n"
         return status_msg
-
-    @classmethod
-    def get_my_ip(cls):
-        """
-            Asks and external server what your ip appears to be (useful is
-            running from behind a NAT/wifi router).  Of course, incoming port
-            to the router must be forwarded correctly.
-        """
-        if 'OPENSHIFT_SECRET_TOKEN' in os.environ:
-            my_ip = os.environ['OPENSHIFT_APP_DNS']
-        else:
-            my_ip = json.load(urllib2.urlopen(
-                'http://httpbin.org/ip'
-            ))['origin']
-        return my_ip
 
     def create_record(self, name, content, username, password):
         ''' Create record '''
@@ -242,9 +235,10 @@ class ExperimentExchangeServices(object):
 class TunnelServices(object):
     ''' Allow psiTurk to puncture firewalls using reverse tunnelling.'''
 
-    def __init__(self):
-        config = PsiturkConfig()
-        config.load_config()
+    def __init__(self, config=None):
+        if not config:
+            config = PsiturkConfig()
+            config.load_config()
         self.access_key = config.get('psiTurk Access', 'psiturk_access_key_id')
         self.secret_key = config.get('psiTurk Access', 'psiturk_secret_access_id')
         self.local_port = config.getint('Server Parameters', 'port')

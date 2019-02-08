@@ -8,7 +8,8 @@ from boto.exception import EC2ResponseError
 from boto.mturk.connection import MTurkConnection, MTurkRequestError
 from boto.mturk.question import ExternalQuestion
 from boto.mturk.qualification import LocaleRequirement, \
-    PercentAssignmentsApprovedRequirement, Qualifications
+    PercentAssignmentsApprovedRequirement, Qualifications, \
+    NumberHitsApprovedRequirement, Requirement
 from flask import jsonify
 import re as re
 from psiturk.psiturk_config import PsiturkConfig
@@ -55,16 +56,23 @@ MYSQL_RESERVED_WORDS_CAP = [
 ]
 MYSQL_RESERVED_WORDS = [word.lower() for word in MYSQL_RESERVED_WORDS_CAP]
 
+class MasterRequirement(Requirement):
+    def __init__(self, sandbox=False, required_to_preview=False):
+        comparator = "Exists"
+        sandbox_qualification_type_id = "2ARFPLSP75KLA8M8DH1HTEQVJT3SY6"
+        production_qualification_type_id = "2F1QJWKUDD8XADTFD2Q0G6UTO95ALH"
+        qualification_type_id = production_qualification_type_id if not sandbox else sandbox_qualification_type_id
+        super(MasterRequirement, self).__init__(qualification_type_id=qualification_type_id, comparator=comparator, required_to_preview=required_to_preview)
 
 class MTurkHIT(object):
     ''' Structure for dealing with MTurk HITs '''
 
-    def __init__(self, json_options):
-        self.options = json_options
+    def __init__(self, options):
+        self.options = options
 
     def __repr__(self):
         for opt in self.options:
-            self.options[opt] = self.options[opt].encode('ascii', 'replace')
+            self.options[opt] = str(self.options[opt]).encode('ascii', 'replace')
         return "%s \n\tStatus: %s \n\tHITid: %s \
             \n\tmax:%s/pending:%s/complete:%s/remain:%s \n\tCreated:%s \
             \n\tExpires:%s\n" % (
@@ -317,17 +325,9 @@ class MTurkServices(object):
     def set_sandbox(self, is_sandbox):
         ''' Set sandbox '''
         self.is_sandbox = is_sandbox
-
-    def get_reviewable_hits(self):
-        ''' Get reviewable HITs '''
-        if not self.connect_to_turk():
-            return False
-        try:
-            hits = self.mtc.get_all_hits()
-        except MTurkRequestError:
-            return False
-        reviewable_hits = [hit for hit in hits if hit.HITStatus == "Reviewable" \
-                           or hit.HITStatus == "Reviewing"]
+    
+    @staticmethod
+    def _hit_xml_to_object(hits):
         hits_data = [MTurkHIT({
             'hitid': hit.HITId,
             'title': hit.Title,
@@ -337,8 +337,9 @@ class MTurkServices(object):
             'number_assignments_pending': hit.NumberOfAssignmentsPending,
             'number_assignments_available': hit.NumberOfAssignmentsAvailable,
             'creation_time': hit.CreationTime,
-            'expiration': hit.Expiration
-        }) for hit in reviewable_hits]
+            'expiration': hit.Expiration,
+            'is_expired': hit.expired
+        }) for hit in hits]
         return hits_data
 
     def get_all_hits(self):
@@ -349,49 +350,19 @@ class MTurkServices(object):
             hits = self.mtc.get_all_hits()
         except MTurkRequestError:
             return False
-        hits_data = [MTurkHIT({
-            'hitid': hit.HITId,
-            'title': hit.Title,
-            'status': hit.HITStatus,
-            'max_assignments': hit.MaxAssignments,
-            'number_assignments_completed': hit.NumberOfAssignmentsCompleted,
-            'number_assignments_pending': hit.NumberOfAssignmentsPending,
-            'number_assignments_available': hit.NumberOfAssignmentsAvailable,
-            'creation_time': hit.CreationTime,
-            'expiration': hit.Expiration,
-            }) for hit in hits]
+        hits_data = self._hit_xml_to_object(hits)
         return hits_data
 
-    def get_active_hits(self):
-        ''' Get active HITs '''
-        if not self.connect_to_turk():
-            return False
-        # hits = self.mtc.search_hits()
-        try:
-            hits = self.mtc.get_all_hits()
-        except MTurkRequestError:
-            return False
-        active_hits = [hit for hit in hits if not hit.expired]
-        hits_data = [MTurkHIT({
-            'hitid': hit.HITId,
-            'title': hit.Title,
-            'status': hit.HITStatus,
-            'max_assignments': hit.MaxAssignments,
-            'number_assignments_completed': hit.NumberOfAssignmentsCompleted,
-            'number_assignments_pending': hit.NumberOfAssignmentsPending,
-            'number_assignments_available': hit.NumberOfAssignmentsAvailable,
-            'creation_time': hit.CreationTime,
-            'expiration': hit.Expiration,
-            }) for hit in active_hits]
-        return hits_data
-
-    def get_workers(self, assignment_status=None):
+    def get_workers(self, assignment_status=None, chosen_hits=None):
         ''' Get workers '''
         if not self.connect_to_turk():
             return False
         try:
-            hits = self.mtc.get_all_hits()
-            hit_ids = [hit.HITId for hit in hits]
+            if chosen_hits:
+                hit_ids = chosen_hits
+            else:
+                hits = self.mtc.get_all_hits()
+                hit_ids = [hit.HITId for hit in hits]
            
             workers_nested = []
             page_size=100
@@ -421,7 +392,8 @@ class MTurkServices(object):
                 workers_nested.append(hit_assignments)
 
             workers = [val for subl in workers_nested for val in subl]  # Flatten nested lists
-        except MTurkRequestError:
+        except MTurkRequestError as e:
+            print e
             return False
         worker_data = [{
             'hitId': worker.HITId,
@@ -431,6 +403,23 @@ class MTurkServices(object):
             'accept_time': worker.AcceptTime,
             'status': worker.AssignmentStatus
         } for worker in workers]
+        return worker_data
+
+    def get_worker(self, assignment_id):
+        if not self.connect_to_turk():
+            return False
+        try:
+            worker = self.mtc.get_assignment(assignment_id)[0]
+        except MTurkRequestError as e:
+            return False
+        worker_data = {
+            'hitId': worker.HITId,
+            'assignmentId': worker.AssignmentId,
+            'workerId': worker.WorkerId,
+            'submit_time': worker.SubmitTime,
+            'accept_time': worker.AcceptTime,
+            'status': worker.AssignmentStatus
+        }
         return worker_data
 
     def bonus_worker(self, assignment_id, amount, reason=""):
@@ -454,7 +443,7 @@ class MTurkServices(object):
         try:
             self.mtc.approve_assignment(assignment_id, feedback=None)
             return True
-        except MTurkRequestError:
+        except MTurkRequestError as e:
             return False
 
     def reject_worker(self, assignment_id):
@@ -528,6 +517,14 @@ class MTurkServices(object):
         quals.add(
             PercentAssignmentsApprovedRequirement("GreaterThanOrEqualTo",
                                                   approve_requirement))
+        number_hits_approved = hit_config['number_hits_approved']
+        quals.add(
+            NumberHitsApprovedRequirement("GreaterThanOrEqualTo",
+                                            number_hits_approved))
+
+        require_master_workers = hit_config['require_master_workers']
+        if require_master_workers:
+            quals.add(MasterRequirement(sandbox=self.is_sandbox))
 
         if hit_config['us_only']:
             quals.add(LocaleRequirement("EqualTo", "US"))
@@ -540,7 +537,7 @@ class MTurkServices(object):
             hit_config['duration'],
             keywords=hit_config['keywords'],
             approval_delay=None,
-            qual_req=None)[0]
+            qual_req=quals)[0]
 
         # Check the config file to see if notifications are wanted.
         config = PsiturkConfig()
@@ -572,14 +569,7 @@ class MTurkServices(object):
             question=mturk_question,
             lifetime=hit_config['lifetime'],
             max_assignments=hit_config['max_assignments'],
-            title=hit_config['title'],
-            description=hit_config['description'],
-            keywords=hit_config['keywords'],
-            reward=hit_config['reward'],
-            duration=hit_config['duration'],
-            approval_delay=None,
             questions=None,
-            qualifications=quals,
             response_groups=[
                 'Minimal',
                 'HITDetail',
@@ -603,7 +593,8 @@ class MTurkServices(object):
             self.configure_hit(hit_config)
             myhit = self.mtc.create_hit(**self.param_dict)[0]
             self.hitid = myhit.HITId
-        except:
+        except MTurkRequestError as e:
+            print e
             return False
         else:
             return self.hitid
@@ -667,3 +658,4 @@ class MTurkServices(object):
         except MTurkRequestError as exception:
             print exception.error_message
             return False
+

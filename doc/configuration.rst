@@ -25,9 +25,8 @@ individual experiments.
    psiturk is not running, and then restart the command shell.
 
 
-
 Global configuration file
---------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The global configuration file resides in your
 home folder in a "dot" file (`/.psiturkconfig`).  This
@@ -57,11 +56,12 @@ You can learn how to obtain proper values for these
 settings by following those links.
 
 You can customize the location of this file to something
-other than the ~ folder by setting the `PSITURK_GLOBAL_CONFIG_LOCATION` 
+other than the ~ folder by setting the `PSITURK_GLOBAL_CONFIG_LOCATION`
 in your shell environment.
 
+
 Local configuration file
---------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~
 
 The local configuration file is specific to each
 project and resides in a file called `config.txt` in the
@@ -78,11 +78,14 @@ project:
     lifetime = 24
     us_only = true
     approve_requirement = 95
+    number_hits_approved = 0
+    require_master_workers = false
     contact_email_on_error = youremail@gmail.com
     ad_group = Default psiTurk Stroop Example
     psiturk_keywords = stroop
     organization_name = New Great University
     browser_exclude_rule = MSIE, mobile, tablet
+    allow_repeats = false
 
     [Database Parameters]
     database_url = sqlite:///participants.db
@@ -98,9 +101,12 @@ project:
     login_username = examplename
     login_pw = examplepassword
     threads = auto
-    secret_key = 'this is my secret key which is hard to guess, i should change this'    
-    #certfile = <path_to.crt> 
+    secret_key = 'this is my secret key which is hard to guess, i should change this'
+    #certfile = <path_to.crt>
     #keyfile = <path_to.key>
+    #adserver_revproxy_host = www.location.of.your.revproxy.sans.protocol.com
+    #adserver_revproxy_port = 80 # defaults to 80
+    #server_timeout = 30
 
     [Task Parameters]
     experiment_code_version = 1.0
@@ -109,9 +115,9 @@ project:
 
     [Shell Parameters]
     launch_in_sandbox_mode = true
+    #bonus_message = "Thanks for participating!"
     use_psiturk_ad_server = true
     ad_location = false
-
 
 This file is divided into a few sections which are
 described in detail.  Each field is described by

@@ -27,7 +27,7 @@ from models import Participant
 from sqlalchemy import or_, exc
 
 from psiturk_config import PsiturkConfig
-from experiment_errors import ExperimentError
+from experiment_errors import ExperimentError, InvalidUsage
 from psiturk.user_utils import nocache
 
 # Setup config
@@ -35,7 +35,10 @@ CONFIG = PsiturkConfig()
 CONFIG.load_config()
 
 # Setup logging
-LOG_FILE_PATH = os.path.join(os.getcwd(), CONFIG.get("Server Parameters", \
+if 'ON_HEROKU' in os.environ:
+    LOG_FILE_PATH = None
+else:
+    LOG_FILE_PATH = os.path.join(os.getcwd(), CONFIG.get("Server Parameters", \
     "logfile"))
 
 LOG_LEVELS = [logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR,
@@ -63,6 +66,8 @@ app = Flask("Experiment_Server")
 app.config.update(SEND_FILE_MAX_AGE_DEFAULT=10)
 app.secret_key = CONFIG.get('Server Parameters', 'secret_key')
 app.logger.info("Secret key: " + app.secret_key)
+
+
 
 # Serving warm, fresh, & sweet custom, user-provided routes
 # ==========================================================
@@ -103,6 +108,14 @@ def handle_exp_error(exception):
     return exception.error_page(request, CONFIG.get('HIT Configuration',
                                                     'contact_email_on_error'))
 
+# for use with API errors
+@app.errorhandler(InvalidUsage)
+def handle_invalid_usage(error):
+    response = jsonify(error.to_dict())
+    response.status_code = error.status_code
+    app.logger.error(error.message)
+    return response
+
 @app.teardown_request
 def shutdown_session(_=None):
     ''' Shut down session route '''
@@ -112,7 +125,7 @@ def shutdown_session(_=None):
 # Experiment counterbalancing code
 # ================================
 
-def get_random_condcount():
+def get_random_condcount(mode):
     """
     HITs can be in one of three states:
         - jobs that are finished
@@ -128,12 +141,18 @@ def get_random_condcount():
                                                            'cutoff_time'))
     starttime = datetime.datetime.now() + cutofftime
 
-    numconds = CONFIG.getint('Task Parameters', 'num_conds')
-    numcounts = CONFIG.getint('Task Parameters', 'num_counters')
+    try: 
+        conditions = json.load(open(os.path.join(app.root_path, 'conditions.json')))
+        numconds = len(conditions.keys())
+        numcounts = 1
+    except IOError as e:
+        numconds = CONFIG.getint('Task Parameters', 'num_conds')
+        numcounts = CONFIG.getint('Task Parameters', 'num_counters')
 
     participants = Participant.query.\
         filter(Participant.codeversion == \
                CONFIG.get('Task Parameters', 'experiment_code_version')).\
+        filter(Participant.mode == mode).\
         filter(or_(Participant.status == COMPLETED,
                    Participant.status == CREDITED,
                    Participant.status == SUBMITTED,
@@ -144,7 +163,9 @@ def get_random_condcount():
         for counter in range(numcounts):
             counts[(cond, counter)] = 0
     for participant in participants:
-        counts[(participant.cond, participant.counterbalance)] += 1
+        condcount = (participant.cond, participant.counterbalance)
+        if condcount in counts:
+            counts[condcount] += 1
     mincount = min(counts.values())
     minima = [hsh for hsh, count in counts.iteritems() if count == mincount]
     chosen = choice(minima)
@@ -183,12 +204,27 @@ def check_worker_status():
         return jsonify(**resp)
     else:
         worker_id = request.args['workerId']
-        try:
-            part = Participant.query.\
-                filter(Participant.workerid == worker_id).one()
-            status = part.status
-        except exc.SQLAlchemyError:
-            status = NOT_ACCEPTED
+        assignment_id = request.args['assignmentId']
+        allow_repeats = CONFIG.getboolean('HIT Configuration', 'allow_repeats')
+        if allow_repeats: # if you allow repeats focus on current worker/assignment combo
+            try:
+                part = Participant.query.\
+                    filter(Participant.workerid == worker_id).\
+                    filter(Participant.assignmentid == assignment_id).one()
+                status = part.status
+            except exc.SQLAlchemyError:
+                status = NOT_ACCEPTED
+        else: # if you disallow repeats search for highest status of anything by this worker
+            try:
+                matches = Participant.query.\
+                    filter(Participant.workerid == worker_id).all()
+                numrecs = len(matches)
+                if numrecs==0: # this should be caught by exception, but just to be safe
+                    status = NOT_ACCEPTED
+                else:
+                    status = max([record.status for record in matches])
+            except exc.SQLAlchemyError:
+                status = NOT_ACCEPTED
         resp = {"status" : status}
         return jsonify(**resp)
 
@@ -264,16 +300,20 @@ def advertisement():
     except exc.SQLAlchemyError:
         status = None
 
-    if status == STARTED and not debug_mode:
+    allow_repeats = CONFIG.getboolean('HIT Configuration', 'allow_repeats')
+    if (status == STARTED or status == QUITEARLY) and not debug_mode:
         # Once participants have finished the instructions, we do not allow
         # them to start the task again.
         raise ExperimentError('already_started_exp_mturk')
-    elif status == COMPLETED:
+    elif status == COMPLETED or (status == SUBMITTED and not already_in_db):
+        # 'or status == SUBMITTED' because we suspect that sometimes the post
+        # to mturk fails after we've set status to SUBMITTED, so really they
+        # have not successfully submitted. This gives another chance for the
+        # submit to work when not using the psiturk ad server.
         use_psiturk_ad_server = CONFIG.getboolean('Shell Parameters', 'use_psiturk_ad_server')
         if not use_psiturk_ad_server:
-            # They've finished the experiment but haven't submitted the HIT
-            # yet.. Turn asignmentId into original assignment id before sending it
-            # back to AMT
+            # They've finished the experiment but haven't successfully submitted the HIT
+            # yet.
             return render_template(
                 'thanks-mturksubmit.html',
                 using_sandbox=(mode == "sandbox"),
@@ -284,7 +324,7 @@ def advertisement():
         else: 
             # Show them a thanks message and tell them to go away.
             return render_template( 'thanks.html' )
-    elif already_in_db and not debug_mode:
+    elif already_in_db and not (debug_mode or allow_repeats):
         raise ExperimentError('already_did_exp_hit')
     elif status == ALLOCATED or not status or debug_mode:
         # Participant has not yet agreed to the consent. They might not
@@ -362,13 +402,21 @@ def start_exp():
 
     # Check first to see if this hitId or assignmentId exists.  If so, check to
     # see if inExp is set
-    matches = Participant.query.\
-        filter(Participant.workerid == worker_id).\
-        all()
+    allow_repeats = CONFIG.getboolean('HIT Configuration', 'allow_repeats')
+    if allow_repeats:
+        matches = Participant.query.\
+            filter(Participant.workerid == worker_id).\
+            filter(Participant.assignmentid == assignment_id).\
+            all()
+    else:
+        matches = Participant.query.\
+            filter(Participant.workerid == worker_id).\
+            all()
+
     numrecs = len(matches)
     if numrecs == 0:
         # Choose condition and counterbalance
-        subj_cond, subj_counter = get_random_condcount()
+        subj_cond, subj_counter = get_random_condcount(mode)
 
         worker_ip = "UNKNOWN" if not request.remote_addr else \
             request.remote_addr
@@ -389,7 +437,8 @@ def start_exp():
             ipaddress=worker_ip,
             browser=browser,
             platform=platform,
-            language=language
+            language=language,
+            mode=mode
         )
         part = Participant(**participant_attributes)
         db_session.add(part)
@@ -448,7 +497,8 @@ def start_exp():
         condition=part.cond,
         counterbalance=part.counterbalance,
         adServerLoc=ad_server_location,
-        mode = mode
+        mode = mode,
+        contact_address=CONFIG.get('HIT Configuration', 'contact_email_on_error')
     )
 
 @app.route('/inexp', methods=['POST'])
@@ -582,10 +632,7 @@ def debug_complete():
         raise ExperimentError('improper_inputs')
     else:
         unique_id = request.args['uniqueId']
-        if unique_id[:5] == "debug":
-            debug_mode = True
-        else:
-            debug_mode = False
+        mode = request.args['mode']
         try:
             user = Participant.query.\
                 filter(Participant.uniqueid == unique_id).one()
@@ -596,10 +643,10 @@ def debug_complete():
         except:
             raise ExperimentError('error_setting_worker_complete')
         else:
-            if debug_mode:
-                return render_template('complete.html')
-            else: # send them back to mturk.
+            if (mode == 'sandbox' or mode == 'live'): # send them back to mturk.
                 return render_template('closepopup.html')
+            else:
+                return render_template('complete.html')
 
 @app.route('/worker_complete', methods=['GET'])
 def worker_complete():
@@ -690,6 +737,8 @@ def run_webserver():
     host = "0.0.0.0"
     port = CONFIG.getint('Server Parameters', 'port')
     print "Serving on ", "http://" +  host + ":" + str(port)
+    app.config['TEMPLATES_AUTO_RELOAD'] = True
+    app.jinja_env.auto_reload = True
     app.run(debug=True, host=host, port=port)
 
 if __name__ == '__main__':

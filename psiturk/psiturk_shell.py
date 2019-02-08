@@ -18,52 +18,22 @@ from fuzzywuzzy import process
 
 from cmd2 import Cmd
 from docopt import docopt, DocoptExit
-import readline
+
+try:
+    import gnureadline as readline
+except ImportError:
+    import readline
 
 import webbrowser
 import sqlalchemy as sa
 
-from amt_services import MTurkServices, RDSServices
+from amt_services_wrapper import MTurkServicesWrapper
 from psiturk_org_services import PsiturkOrgServices, TunnelServices
 from version import version_number
 from psiturk_config import PsiturkConfig
 import experiment_server_controller as control
-from db import db_session, init_db
 from models import Participant
-
-
-def colorize(target, color, use_escape=True):
-    ''' Colorize target string. Set use_escape to false when text will not be
-    interpreted by readline, such as in intro message.'''
-    def escape(code):
-        ''' Escape character '''
-        return '\001%s\002' % code
-    if color == 'purple':
-        color_code = '\033[95m'
-    elif color == 'cyan':
-        color_code = '\033[96m'
-    elif color == 'darkcyan':
-        color_code = '\033[36m'
-    elif color == 'blue':
-        color_code = '\033[93m'
-    elif color == 'green':
-        color_code = '\033[92m'
-    elif color == 'yellow':
-        color_code = '\033[93m'
-    elif color == 'red':
-        color_code = '\033[91m'
-    elif color == 'white':
-        color_code = '\033[37m'
-    elif color == 'bold':
-        color_code = '\033[1m'
-    elif color == 'underline':
-        color_code = '\033[4m'
-    else:
-        color_code = ''
-    if use_escape:
-        return escape(color_code) + target + escape('\033[0m')
-    else:
-        return color_code + target + '\033[m'
+from utils import *
 
 def docopt_cmd(func):
     """
@@ -104,7 +74,7 @@ class PsiturkShell(Cmd, object):
         psiturk_shell -c
     """
 
-    def __init__(self, config, server):
+    def __init__(self, config, server, quiet=False):
         Cmd.__init__(self)
         self.config = config
         self.server = server
@@ -115,9 +85,12 @@ class PsiturkShell(Cmd, object):
         self.help_path = os.path.join(os.path.dirname(__file__), "shell_help/")
         self.psiturk_header = 'psiTurk command help:'
         self.super_header = 'basic CMD command help:'
-
-        self.color_prompt()
-        self.intro = self.get_intro_prompt()
+        
+        if not self.quiet:
+            self.color_prompt()
+            self.intro = self.get_intro_prompt()
+        else:
+            self.intro = ''
 
         self.already_prelooped = False
 
@@ -215,8 +188,226 @@ class PsiturkShell(Cmd, object):
         ''' Add space after a completion, makes tab completion with
         multi-word commands cleaner. '''
         return Cmd.complete(self, text, state) + ' '
+    
+    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
+    #   hit management
+    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
+    def hit_list(self, active_hits, reviewable_hits, all_studies):
+        ''' List hits. '''
+        if active_hits:
+            hits_data = self.amt_services_wrapper.get_active_hits(all_studies)
+        elif reviewable_hits:
+            hits_data = self.amt_services_wrapper.get_reviewable_hits(all_studies)
+        else:
+            hits_data = self.amt_services_wrapper.get_all_hits(all_studies)
+        if not hits_data:
+            print '*** no hits retrieved'
+        else:
+            for hit in hits_data:
+                print hit
+    
+    def _estimate_expenses(self, num_workers, reward):
+        ''' Returns tuple describing expenses:
+        amount paid to workers
+        amount paid to amazon'''
+        
+        # fee structure changed 07.22.15:
+        # 20% for HITS with < 10 assignments
+        # 40% for HITS with >= 10 assignments
+        commission = 0.2
+        if float(num_workers) >= 10:
+            commission = 0.4 
+        work = float(num_workers) * float(reward)
+        fee = work * commission
+        return (work, fee, work+fee)
+        
+    def _confirm_dialog(self, prompt):
+        ''' Prompts for a 'yes' or 'no' to given prompt. '''
+        response = raw_input(prompt).strip().lower()
+        valid = {'y': True, 'ye': True, 'yes': True, 'n': False, 'no': False}
+        while True:
+            try:
+                return valid[response]
+            except:
+                response = raw_input("Please respond 'y' or 'n': ").strip().lower()
+    
+    def hit_create(self, numWorkers, reward, duration):
+        
+        if self.sandbox:
+            mode = 'sandbox'
+        else:
+            mode = 'live'
+        
+        # Argument retrieval and validation
+        if numWorkers is None:
+            numWorkers = raw_input('number of participants? ').strip()
+        try:
+            numWorkers = int(numWorkers)
+        except ValueError:
+            print '*** number of participants must be a whole number'
+            return
+        if numWorkers <= 0:
+            print '*** number of participants must be greater than 0'
+            return
 
+        if reward is None:
+            reward = raw_input('reward per HIT? ').strip()
+        p = re.compile('^\d*\.\d\d$')
+        m = p.match(reward)
+        if m is None:
+            print '*** reward must have format [dollars].[cents]'
+            return
+        try:
+            reward = float(reward)
+        except:
+            print '*** reward must be in format [dollars].[cents]'
+            return
+            
+        if duration is None:
+            duration = raw_input(
+                'duration of hit (in hours, it can be decimals)? ').strip()
+        try:
+            duration = float(duration)
+        except ValueError:
+            print '*** duration must a number'
+            return
+        if duration <= 0:
+            print '*** duration must be greater than 0'
+            return
 
+        _, fee, total = self._estimate_expenses(numWorkers, reward)
+        
+        if not self.quiet:
+            dialog_query = '\n'.join(['*****************************',
+                                      '    Max workers: %d' % numWorkers,
+                                      '    Reward: $%.2f' % reward,
+                                      '    Duration: %s hours' % duration,
+                                      '    Fee: $%.2f' % fee,
+                                      '    ________________________',
+                                      '    Total: $%.2f' % total,
+                                      'Create %s HIT [y/n]? ' % colorize(mode, 'bold')])
+            if not self._confirm_dialog(dialog_query):
+                print '*** Cancelling HIT creation.'
+                return
+        
+        try:
+            (hit_id, ad_id) = self.amt_services_wrapper.hit_create(numWorkers, reward,
+                            duration)
+                            
+            print '\n'.join(['*****************************',
+                             '  Created %s HIT' % colorize(mode, 'bold'),
+                             '    HITid: %s' % str(hit_id),
+                             '    Max workers: %d' % numWorkers,
+                             '    Reward: $%.2f' % reward,
+                             '    Duration: %s hours' % duration,
+                             '    Fee: $%.2f' % fee,
+                             '    ________________________',
+                             '    Total: $%.2f' % total])
+                             
+            # Print the Ad Url
+            use_psiturk_ad_server = self.config.getboolean('Shell Parameters', 'use_psiturk_ad_server')
+            if use_psiturk_ad_server:
+                ad_url = ''
+                if use_psiturk_ad_server:
+                    if self.sandbox:
+                        ad_url_base = 'https://sandbox.ad.psiturk.org/view'
+                    else:
+                        ad_url_base = 'https://ad.psiturk.org/view'
+                    ad_url = '{}/{}?assignmentId=debug{}&hitId=debug{}&workerId=debug{}'.format( 
+                        ad_url_base, str(ad_id), str(self.random_id_generator()), str(self.random_id_generator()), str(self.random_id_generator()))
+
+            else:
+                options = { 
+                    'base': self.config.get('Shell Parameters', 'ad_location'), 
+                    'mode': mode,
+                    'assignmentid': str(self.random_id_generator()),
+                    'hitid': str(self.random_id_generator()),
+                    'workerid': str(self.random_id_generator())
+                  }
+                ad_url = '{base}?mode={mode}&assignmentId=debug{assignmentid}&hitId=debug{hitid}&workerId=debug{workerid}'.format(**options)
+            print('  Ad URL: {}'.format(ad_url) )
+            print "Note: This url cannot be used to run your full psiTurk experiment.  It is only for testing your ad."
+
+            # Print the Mturk Url
+            mturk_url = ''
+            if self.sandbox:
+                mturk_url_base = 'https://workersandbox.mturk.com'
+            else:
+                mturk_url_base = 'https://worker.mturk.com'
+            mturk_url = '{}/projects?filters%5Bsearch_term%5D={}'.format(
+                mturk_url_base,
+                urllib.quote_plus(
+                    str(self.config.get('HIT Configuration', 'title', raw=True))))
+
+            print('  MTurk URL: {}'.format(mturk_url) )
+            print "Hint: In OSX, you can open a terminal link using cmd + click"
+            if self.sandbox and use_psiturk_ad_server:
+                print "Note: This sandboxed ad will expire from the server in 16 days."
+        except Exception as e:
+            print e
+    
+    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
+    #   worker management
+    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
+    def worker_list(self, submitted, approved, rejected, chosen_hits, all_studies=False):
+        try:
+            status = None
+            if submitted:
+                status='Submitted'
+            elif approved:
+                status='Approved'
+            elif rejected:
+                status='Rejected'
+                
+            workers = self.amt_services_wrapper.get_workers(status, chosen_hits, all_studies=all_studies)
+            if not len(workers):
+                print "*** no workers match your request"
+            else:
+                worker_json = json.dumps(workers, indent=4,
+                                 separators=(',', ': '))        
+                if worker_json:
+                    print worker_json
+        
+        except Exception as e:
+            print colorize(repr(e), 'red')
+    
+    def worker_approve(self, all=False, chosen_hits=None, assignment_ids=None, all_studies=False, force=False):        
+        
+        if all_studies and not force:
+            print 'option --all-studies must be used along with --force'
+            return
+        
+        all_studies_msg = ' for the current study'
+        if all_studies:
+            all_studies_msg = ' from all studies'
+        
+        force_msg = ''
+        if force:
+            force_msg = " even if they're not found in the local psiturk db"
+        
+        if all:
+            print "Approving all submissions{}{}...".format(all_studies_msg, force_msg)
+        elif chosen_hits:
+            print "Approving submissions for HITs {}{}{}".format(' '.join(chosen_hits), all_studies_msg, force_msg)
+        else:
+            print "Approving specified submissions{}{}...".format(all_studies_msg, force_msg)
+            
+        workers = self.amt_services_wrapper.get_workers("Submitted", chosen_hits, assignment_ids, all_studies=all_studies)
+        if not workers:
+            if chosen_hits:
+                print "No submissions found for requested HIT ID(s). Are you in the right `mode`? Do you need to pass `--all-studies --force`?"
+            elif assignment_ids:
+                print "No submissions found for requested assignment ID(s). Are you in the right `mode`? Do you need to pass `--all-studies --force`?"
+            else:
+                print "No submissions found. Are you in the right `mode`? Do you need to pass `--all-studies`?"
+            return        
+        
+        for worker in workers:
+            try:
+                result = self.amt_services_wrapper.approve_worker(worker, force=force)
+                print result
+            except Exception as e:
+                print colorize(str(e), 'red')
     # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
     #   server management
     # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
@@ -262,7 +453,19 @@ class PsiturkShell(Cmd, object):
                    "your experiment.  Try 'server on' first.")
             return
 
-        if 'OPENSHIFT_SECRET_TOKEN' in os.environ:
+        revproxy_url = False
+        if self.config.has_option('Server Parameters','adserver_revproxy_host'):
+            if self.config.has_option( 'Server Parameters', 'adserver_revproxy_port'):
+                port = self.config.get( 'Server Parameters', 'adserver_revproxy_port')
+            else:
+                port = 80
+            revproxy_url = "http://{}:{}/ad".format(self.config.get('Server Parameters', 
+                                                                    'adserver_revproxy_host'),
+                                                    port)
+
+        if revproxy_url:
+            base_url = revproxy_url
+        elif 'OPENSHIFT_SECRET_TOKEN' in os.environ:
             base_url = "http://" + self.config.get('Server Parameters', 'host')\
             + "/ad"
         else:
@@ -518,20 +721,31 @@ class PsiturkShell(Cmd, object):
 class PsiturkNetworkShell(PsiturkShell):
     ''' Extends PsiturkShell class to include online psiTurk.org features '''
 
-    def __init__(self, config, amt_services, aws_rds_services, web_services,
-                 server, sandbox, quiet=False):
+    _cached_web_services = None
+    
+    @property
+    def web_services(self):
+        if not self._cached_web_services:
+            self._cached_web_services = PsiturkOrgServices(
+                self.config.get('psiTurk Access', 'psiturk_access_key_id'),
+                self.config.get('psiTurk Access', 'psiturk_secret_access_id')) 
+            self.amt_services_wrapper.set_web_services(self._cached_web_services)
+        return self._cached_web_services
+    
+    def __init__(self, config, server, sandbox, quiet=False):
         self.config = config
-        self.amt_services = amt_services
-        self.web_services = web_services
-        self.db_services = aws_rds_services
-        self.sandbox = sandbox
         self.quiet = quiet
+        self.amt_services_wrapper = MTurkServicesWrapper(config=config, sandbox=sandbox)        
+        
+        self.sandbox = sandbox
         self.tunnel = TunnelServices()
-
+        
         self.sandbox_hits = 0
         self.live_hits = 0
-        self.tally_hits()
-        PsiturkShell.__init__(self, config, server)
+        
+        if not quiet:
+            self.update_hit_tally()
+        PsiturkShell.__init__(self, config, server, quiet)
 
         # Prevents running of commands by abbreviation
         self.abbrev = False
@@ -624,7 +838,7 @@ class PsiturkNetworkShell(PsiturkShell):
     def do_status(self, arg): # overloads do_status with AMT info
         super(PsiturkNetworkShell, self).do_status(arg)
         # server_status = self.server.is_server_running()  # Not used
-        self.tally_hits()
+        self.update_hit_tally()
         if self.sandbox:
             print 'AMT worker site - ' + colorize('sandbox', 'bold') + ': ' \
             + str(self.sandbox_hits) + ' HITs available'
@@ -632,504 +846,28 @@ class PsiturkNetworkShell(PsiturkShell):
             print 'AMT worker site - ' + colorize('live', 'bold') + ': ' \
             + str(self.live_hits) + ' HITs available'
 
-
-    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
-    #   worker management
-    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
-    @staticmethod
-    def add_bonus(worker_dict):
-        " Adds DB-logged worker bonus to worker list data "
-        try:
-            unique_id = '{}:{}'.format(worker_dict['workerId'], worker_dict['assignmentId'])
-            worker = Participant.query.filter(
-                Participant.uniqueid == unique_id).one()
-            worker_dict['bonus'] = worker.bonus
-        except sa.exc.InvalidRequestError:
-            # assignment is found on mturk but not in local database.
-            worker_dict['bonus'] = 'N/A'
-        return worker_dict
-
-    def worker_list(self, submitted, approved, rejected, chosen_hit):
-        ''' List worker stats '''
-        workers = None
-        if submitted:
-            workers = self.amt_services.get_workers("Submitted")
-        elif approved:
-            workers = self.amt_services.get_workers("Approved")
-        elif rejected:
-            workers = self.amt_services.get_workers("Rejected")
-        else:
-            workers = self.amt_services.get_workers()
-        if workers is False:
-            print colorize('*** failed to get workers', 'red')
-        if chosen_hit:
-            workers = [worker for worker in workers if \
-                       worker['hitId'] == chosen_hit]
-            print 'listing workers for HIT', chosen_hit
-        if not len(workers):
-            print "*** no workers match your request"
-        else:
-            workers = [self.add_bonus(worker)
-                       for worker in workers]
-            print json.dumps(workers, indent=4,
-                             separators=(',', ': '))
-
-    def worker_approve(self, chosen_hit, assignment_ids=None):
-        ''' Approve worker '''
-        if chosen_hit:
-            workers = self.amt_services.get_workers("Submitted")
-            assignment_ids = [worker['assignmentId'] for worker in workers if \
-                              worker['hitId'] == chosen_hit]
-            print 'approving workers for HIT', chosen_hit
-        for assignment_id in assignment_ids:
-            success = self.amt_services.approve_worker(assignment_id)
-            if success:
-                try:
-                    init_db()
-                    part = Participant.query.\
-                           filter(Participant.assignmentid == assignment_id).\
-                           filter(Participant.status == 4).\
-                           one()
-                    part.status = 5
-                    db_session.add(part)
-                    db_session.commit()
-                    print 'approved', assignment_id
-                except:
-                    print "*** approved but failed to update status in db for", assignment_id
+    def update_hit_tally(self):
+        ''' Tally hits '''
+        if not self.quiet:            
+            num_hits = self.amt_services_wrapper.tally_hits()
+            if self.sandbox:
+                self.sandbox_hits = num_hits
             else:
-                print '*** failed to approve', assignment_id
-
-    def worker_reject(self, chosen_hit, assignment_ids = None):
-        ''' Reject worker '''
-        if chosen_hit:
-            workers = self.amt_services.get_workers("Submitted")
-            assignment_ids = [worker['assignmentId'] for worker in workers if \
-                              worker['hitId'] == chosen_hit]
-            print 'rejecting workers for HIT', chosen_hit
-        for assignment_id in assignment_ids:
-            success = self.amt_services.reject_worker(assignment_id)
-            if success:
-                print 'rejected', assignment_id
-            else:
-                print '*** failed to reject', assignment_id
-
-    def worker_unreject(self, chosen_hit, assignment_ids = None):
-        ''' Unreject worker '''
-        if chosen_hit:
-            workers = self.amt_services.get_workers("Rejected")
-            assignment_ids = [worker['assignmentId'] for worker in workers if \
-                              worker['hitId'] == chosen_hit]
-        for assignment_id in assignment_ids:
-            success = self.amt_services.unreject_worker(assignment_id)
-            if success:
-                print 'unrejected %s' % (assignment_id)
-            else:
-                print '*** failed to unreject', assignment_id
-
-    def worker_bonus(self, chosen_hit, auto, amount, reason,
-                     assignment_ids=None):
-        ''' Bonus worker '''
-        while not reason:
-            user_input = raw_input("Type the reason for the bonus. Workers "
-                                   "will see this message: ")
-            reason = user_input
-        # Bonus already-bonused workers if the user explicitly lists their
-        # worker IDs
-        override_status = True
-        if chosen_hit:
-            override_status = False
-            workers = self.amt_services.get_workers("Approved")
-            if workers is False:
-                print "No approved workers for HIT", chosen_hit
-                return
-            assignment_ids = [worker['assignmentId'] for worker in workers if \
-                              worker['hitId'] == chosen_hit]
-            print 'bonusing workers for HIT', chosen_hit
-        for assignment_id in assignment_ids:
-            try:
-                init_db()
-                part = Participant.query.\
-                       filter(Participant.assignmentid == assignment_id).\
-                       filter(Participant.endhit != None).\
-                       one()
-                if auto:
-                    amount = part.bonus
-                status = part.status
-                if amount <= 0:
-                    print "bonus amount <=$0, no bonus given to", assignment_id
-                elif status == 7 and not override_status:
-                    print "bonus already awarded to ", assignment_id
-                else:
-                    success = self.amt_services.bonus_worker(assignment_id,
-                                                             amount, reason)
-                    if success:
-                        print "gave bonus of $" + str(amount) + " to " + \
-                        assignment_id
-                        part.status = 7
-                        db_session.add(part)
-                        db_session.commit()
-                        db_session.remove()
-                    else:
-                        print "*** failed to bonus", assignment_id
-            except:
-                print "*** failed to bonus", assignment_id
+                self.live_hits = num_hits
 
     # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
     #   hit management
     # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
     def do_amt_balance(self, _):
         ''' Get MTurk balance '''
-        print self.amt_services.check_balance()
+        print self.amt_services_wrapper.amt_balance()
 
     def help_amt_balance(self):
         ''' Get help for amt_balance. '''
         with open(self.help_path + 'amt.txt', 'r') as help_text:
             print help_text.read()
 
-    def hit_list(self, active_hits, reviewable_hits):
-        ''' List hits. '''
-        hits_data = []
-        if active_hits:
-            hits_data = self.amt_services.get_active_hits()
-        elif reviewable_hits:
-            hits_data = self.amt_services.get_reviewable_hits()
-        else:
-            hits_data = self.amt_services.get_all_hits()
-        if not hits_data:
-            print '*** no hits retrieved'
-        else:
-            for hit in hits_data:
-                print hit
-
-    def hit_extend(self, hit_id, assignments, minutes):
-        """ Add additional worker assignments or minutes to a HIT.
-
-        Args:
-            hit_id: A list conaining one hit_id string.
-            assignments: Variable <int> for number of assignments to add.
-            minutes: Variable <int> for number of minutes to add.
-
-        Returns:
-            A side effect of this function is that the state of a HIT changes
-            on AMT servers.
-
-        Raises:
-
-        """
-
-        assert type(hit_id) is list
-        assert type(hit_id[0]) is str
-
-        if self.amt_services.extend_hit(hit_id[0], assignments, minutes):
-            print "HIT extended."
-
-    def hit_dispose(self, all_hits, hit_ids=None):
-        ''' Dispose HIT. '''
-        if all_hits:
-            hits_data = self.amt_services.get_all_hits()
-            hit_ids = [hit.options['hitid'] for hit in hits_data if \
-                       hit.options['status'] == "Reviewable"]
-        for hit in hit_ids:
-            # Check that the HIT is reviewable
-            status = self.amt_services.get_hit_status(hit)
-            if not status:
-                print "*** Error getting hit status"
-                return
-            if self.amt_services.get_hit_status(hit) != "Reviewable":
-                print("*** This hit is not 'Reviewable' and so can not be "
-                      "disposed of")
-                return
-            else:
-                success = self.amt_services.dispose_hit(hit)
-                # self.web_services.delete_ad(hit)  # also delete the ad
-                if success:
-                    if self.sandbox:
-                        print "deleting sandbox HIT", hit
-                    else:
-                        print "deleting live HIT", hit
-        self.tally_hits()
-
-    def hit_expire(self, all_hits, hit_ids=None):
-        ''' Expire all HITs. '''
-        if all_hits:
-            hits_data = self.amt_services.get_active_hits()
-            hit_ids = [hit.options['hitid'] for hit in hits_data]
-        for hit in hit_ids:
-            success = self.amt_services.expire_hit(hit)
-            if success:
-                if self.sandbox:
-                    print "expiring sandbox HIT", hit
-                else:
-                    print "expiring live HIT", hit
-        self.tally_hits()
-
-    def tally_hits(self):
-        ''' Tally hits '''
-        hits = self.amt_services.get_active_hits()
-        num_hits = 0
-        if hits:
-            num_hits = len(hits)
-        if self.sandbox:
-            self.sandbox_hits = num_hits
-        else:
-            self.live_hits = num_hits
-
-    def hit_create(self, numWorkers, reward, duration):
-
-        server_loc = str(self.config.get('Server Parameters', 'host'))
-        inaccessible_but_do_it_anyways = False
-        if not self.quiet:
-            if server_loc in ['localhost', '127.0.0.1']:
-                print '\n'.join(['*****************************',
-                "  Sorry, your server is set for local debugging only.  You cannot",\
-                "  make public HITs or Ads.  Please edit the config.txt file inside",\
-                "  your project folder and set the 'host' variable in the 'Server",\
-                "  Parameters' section to something other than 'localhost' or",\
-                "  '127.0.0.1'.  This will make your psiturk server process",\
-                "  reachable by the external world.  The most useful option is",\
-                "  '0.0.0.0'", ""])
-
-                user_input = raw_input(
-                    '\n'.join(['  If you are using an external server process press'\
-                               ' `y` to continue.', '  Otherwise press `n` to'\
-                               ' cancel:  ']
-                              ))
-                if user_input != 'y':
-                    return
-                else:
-                    inaccessible_but_do_it_anyways = True
-        
-        use_psiturk_ad_server = self.config.getboolean('Shell Parameters', 'use_psiturk_ad_server')
-
-        if use_psiturk_ad_server:
-            if not self.web_services.check_credentials():
-                print '\n'.join(['*****************************',
-                                '  Sorry, your psiTurk Credentials are invalid.\n ',
-                                '  You cannot create ads and hits until you enter valid credentials in ',
-                                '  the \'psiTurk Access\' section of ~/.psiturkconfig.  You can obtain your',
-                                '  credentials or sign up at https://www.psiturk.org/login.\n'])
-                return
-
-        if not self.amt_services.verify_aws_login():
-            print '\n'.join(['*****************************',
-                             '  Sorry, your AWS Credentials are invalid.\n ',
-                             '  You cannot create ads and hits until you enter valid credentials in ',
-                             '  the \'AWS Access\' section of ~/.psiturkconfig.  You can obtain your ',
-                             '  credentials via the Amazon AMT requester website.\n'])
-            return
-
-        if not self.quiet:
-            if self.server.is_server_running() != 'yes' and not inaccessible_but_do_it_anyways:
-                print '\n'.join(['*****************************',
-                                 '  Your psiTurk server is currently not running but you are trying to create ',
-                                 '  an Ad/HIT.  This can cause problems for worker trying to access your ',
-                                 '  hit.  Please start the server by first typing \'server on\' then try this ',
-                                 '  command again.',
-                                 ''])
-                user_input = raw_input('\n'.join([
-                    '  If you are using an external server process, press `y` to continue.',
-                    '  Otherwise, press `n` to cancel:'
-                ]))
-                if user_input != 'y':
-                    return
-
-        interactive = False
-        if numWorkers is None:
-            interactive = True
-            numWorkers = raw_input('number of participants? ')
-        try:
-            int(numWorkers)
-        except ValueError:
-
-            print '*** number of participants must be a whole number'
-            return
-        if int(numWorkers) <= 0:
-            print '*** number of participants must be greater than 0'
-            return
-        if interactive:
-            reward = raw_input('reward per HIT? ')
-        p = re.compile('\d*.\d\d')
-        m = p.match(reward)
-        if m is None:
-            print '*** reward must have format [dollars].[cents]'
-            return
-        if interactive:
-            duration = raw_input('duration of hit (in hours, it can be decimals)? ')
-
-        duration = float(duration)
-
-        if duration <= 0:
-            print '*** duration must be greater than 0'
-            return
-
-        if use_psiturk_ad_server:
-
-            ad_id = self.create_psiturk_ad() 
-            create_failed = False
-            fail_msg = None
-            if ad_id is not False:
-                ad_location = self.web_services.get_ad_url(ad_id, int(self.sandbox))
-                hit_config = self.generate_hit_config(ad_location, numWorkers, reward, duration )
-                hit_id = self.amt_services.create_hit(hit_config)
-                if hit_id is not False:
-                    if not self.web_services.set_ad_hitid(ad_id, hit_id, int(self.sandbox)):
-                        create_failed = True
-                        fail_msg = "  Unable to update Ad on http://ad.psiturk.org to point at HIT."
-                else:
-                    create_failed = True
-                    fail_msg = "  Unable to create HIT on Amazon Mechanical Turk."
-            else:
-                create_failed = True
-                fail_msg = "  Unable to create Ad on http://ad.psiturk.org."
-
-        else: # not using psiturk ad server
-
-            mode = 'sandbox' if self.sandbox else 'live'
-            ad_location = "{}?mode={}".format(self.config.get('Shell Parameters', 'ad_location'), mode )
-            hit_config = self.generate_hit_config(ad_location, numWorkers, reward, duration )
-            create_failed = False
-            hit_id = self.amt_services.create_hit(hit_config)
-            if hit_id is False:
-                create_failed = True
-                fail_msg = "  Unable to create HIT on Amazon Mechanical Turk."
-
-        if create_failed:
-            print '\n'.join(['*****************************',
-                             '  Sorry, there was an error creating hit and registering ad.'])
-            if fail_msg:
-                print fail_msg
-
-        else:
-            if self.sandbox:
-                self.sandbox_hits += 1
-            else:
-                self.live_hits += 1
-            # print results
-            # fee structure changed 07.22.15:
-            # 20% for HITS with < 10 assignments
-            # 40% for HITS with >= 10 assignments
-            commission = 0.2
-            if float(numWorkers) >= 10:
-                commission = 0.4 
-
-            total = float(numWorkers) * float(reward)
-            fee = total * commission
-            total = total + fee
-            mode = ''
-            if self.sandbox:
-                mode = 'sandbox'
-            else:
-                mode = 'live'
-            print '\n'.join(['*****************************',
-                             '  Creating %s HIT' % colorize(mode, 'bold'),
-                             '    HITid: %s' % str(hit_id),
-                             '    Max workers: %s' % numWorkers,
-                             '    Reward: $%s' %reward,
-                             '    Duration: %s hours' % duration,
-                             '    Fee: $%.2f' % fee,
-                             '    ________________________',
-                             '    Total: $%.2f' % total])
-
-            # Print the Ad Url
-            ad_url = ''
-            if use_psiturk_ad_server:
-                if self.sandbox:
-                    ad_url_base = 'https://sandbox.ad.psiturk.org/view'
-                else:
-                    ad_url_base = 'https://ad.psiturk.org/view'
-                ad_url = '{}/{}?assignmentId=debug{}&hitId=debug{}&workerId=debug{}'.format( 
-                    ad_url_base, str(ad_id), str(self.random_id_generator()), str(self.random_id_generator()), str(self.random_id_generator()))
-
-            else:
-                options = { 
-                    'base': self.config.get('Shell Parameters', 'ad_location'), 
-                    'mode': mode,
-                    'assignmentid': str(self.random_id_generator()),
-                    'hitid': str(self.random_id_generator()),
-                    'workerid': str(self.random_id_generator())
-                  }
-                ad_url = '{base}?mode={mode}&assignmentId=debug{assignmentid}&hitId=debug{hitid}&workerId=debug{workerid}'.format(**options)
-            print('  Ad URL: {}'.format(ad_url) )
-            print "Note: This url cannot be used to run your full psiTurk experiment.  It is only for testing your ad."
-
-            # Print the Mturk Url
-            mturk_url = ''
-            if self.sandbox:
-                mturk_url_base = 'https://workersandbox.mturk.com'
-            else:
-                mturk_url_base = 'https://www.mturk.com'
-            mturk_url = '{}/mturk/searchbar?selectedSearchType=hitgroups&searchWords={}'.format(
-                mturk_url_base, urllib.quote_plus(str(self.config.get('HIT Configuration', 'title'))) )
-
-            print('  MTurk URL: {}'.format(mturk_url) )
-            print "Hint: In OSX, you can open a terminal link using cmd + click"
-            if self.sandbox and use_psiturk_ad_server:
-                print "Note: This sandboxed ad will expire from the server in 16 days."
-
-    def create_psiturk_ad(self):
-        # register with the ad server (psiturk.org/ad/register) using POST
-        if os.path.exists('templates/ad.html'):
-            ad_html = open('templates/ad.html').read()
-        else:
-            print '\n'.join(['*****************************',
-                '  Sorry, there was an error registering ad.',
-                '  The file ad.html is required to be in the templates folder',
-                '  of your project so that the ad can be served.'])
-            return
-
-        size_of_ad = sys.getsizeof(ad_html)
-        if size_of_ad >= 1048576:
-            print '\n'.join(['*****************************',
-                '  Sorry, there was an error registering the ad.',
-                '  Your local ad.html is %s bytes, but the maximum',
-                '  template size uploadable to the ad server is',
-                '  1048576 bytes.' % size_of_ad])
-            return
-
-        # what all do we need to send to server?
-        # 1. server
-        # 2. port
-        # 3. support_ie?
-        # 4. ad.html template
-        # 5. contact_email in case an error happens
-
-        if self.tunnel.is_open:
-            ip_address = self.tunnel.url
-            port = str(self.tunnel.tunnel_port)  # Set by tunnel server.
-        else:
-            ip_address = str(self.web_services.get_my_ip())
-            port = str(self.config.get('Server Parameters', 'port'))
-        ad_content = {
-            'psiturk_external': True,
-            'server': ip_address,
-            'port': port,
-            'browser_exclude_rule': str(self.config.get('HIT Configuration', 'browser_exclude_rule')),
-            'is_sandbox': int(self.sandbox),
-            'ad_html': ad_html,
-            # 'amt_hit_id': hitid, Don't know this yet
-            'organization_name': str(self.config.get('HIT Configuration', 'organization_name')),
-            'experiment_name': str(self.config.get('HIT Configuration', 'title')),
-            'contact_email_on_error': str(self.config.get('HIT Configuration', 'contact_email_on_error')),
-            'ad_group': str(self.config.get('HIT Configuration', 'ad_group')),
-            'keywords': str(self.config.get('HIT Configuration', 'psiturk_keywords'))
-        }
-        ad_id = self.web_services.create_ad(ad_content)
-        return ad_id
     
-    def generate_hit_config(self, ad_location, numWorkers, reward, duration):
-        hit_config = {
-            "ad_location": ad_location,
-            "approve_requirement": self.config.get('HIT Configuration', 'Approve_Requirement'),
-            "us_only": self.config.getboolean('HIT Configuration', 'US_only'),
-            "lifetime": datetime.timedelta(hours=self.config.getfloat('HIT Configuration', 'lifetime')),
-            "max_assignments": numWorkers,
-            "title": self.config.get('HIT Configuration', 'title'),
-            "description": self.config.get('HIT Configuration', 'description'),
-            "keywords": self.config.get('HIT Configuration', 'amt_keywords'),
-            "reward": reward,
-            "duration": datetime.timedelta(hours=duration)
-        }
-        return hit_config
 
     @docopt_cmd
     def do_db(self, arg):
@@ -1185,420 +923,6 @@ class PsiturkNetworkShell(PsiturkShell):
         with open(self.help_path + 'db.txt', 'r') as help_text:
             print help_text.read()
 
-
-    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
-    #   AWS RDS commands
-    # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
-    def db_aws_list_regions(self):
-        ''' List AWS DB regions '''
-        regions = self.db_services.list_regions()
-        if regions != []:
-            print "Avaliable AWS regions:"
-        for reg in regions:
-            print '\t' + reg,
-            if reg == self.db_services.get_region():
-                print "(currently selected)"
-            else:
-                print ''
-
-    def db_aws_get_region(self):
-        ''' Get AWS region '''
-        print self.db_services.get_region()
-
-    def db_aws_set_region(self, region_name):
-        ''' Set AWS region '''
-        # interactive = False # Not used
-        if region_name is None:
-            # interactive = True  # Not used
-            self.db_aws_list_regions()
-            allowed_regions = self.db_services.list_regions()
-            region_name = "NONSENSE WORD1234"
-            tries = 0
-            while region_name not in allowed_regions:
-                if tries == 0:
-                    region_name = raw_input('Enter the name of the region you '
-                                            'would like to use: ')
-                else:
-                    print("*** The region name (%s) you entered is not allowed, " \
-                          "please choose from the list printed above (use type 'db " \
-                          "aws_list_regions'." % region_name)
-                    region_name = raw_input('Enter the name of the region you '
-                                            'would like to use: ')
-                tries += 1
-                if tries > 5:
-                    print("*** Error, region you are requesting not available.  "
-                          "No changes made to regions.")
-                    return
-        self.db_services.set_region(region_name)
-        print "Region updated to ", region_name
-        self.config.set('AWS Access', 'aws_region', region_name, True)
-        if self.server.is_server_running() == 'yes':
-            self.server_restart()
-
-    def db_aws_list_instances(self):
-        ''' List AWS DB instances '''
-        instances = self.db_services.get_db_instances()
-        if not instances:
-            print("There are no DB instances associated with your AWS account " \
-                "in region " + self.db_services.get_region())
-        else:
-            print("Here are the current DB instances associated with your AWS " \
-                "account in region " + self.db_services.get_region())
-            for dbinst in instances:
-                print '\t'+'-'*20
-                print "\tInstance ID: " + dbinst.id
-                print "\tStatus: " + dbinst.status
-
-    def db_aws_delete_instance(self, instance_id):
-        ''' Delete AWS DB instance '''
-        interactive = False
-        if instance_id is None:
-            interactive = True
-
-        instances = self.db_services.get_db_instances()
-        instance_list = [dbinst.id for dbinst in instances]
-
-        if interactive:
-            valid = False
-            if len(instances) == 0:
-                print("There are no instances you can delete currently.  Use "
-                      "`db aws_create_instance` to make one.")
-                return
-            print "Here are the available instances you can delete:"
-            for inst in instances:
-                print "\t ", inst.id, "(", inst.status, ")"
-            while not valid:
-                instance_id = raw_input('Enter the instance identity you would '
-                                        'like to delete: ')
-                res = self.db_services.validate_instance_id(instance_id)
-                if res is True:
-                    valid = True
-                else:
-                    print(res + " Try again, instance name not valid.  Check " \
-                        "for typos.")
-                if instance_id in instance_list:
-                    valid = True
-                else:
-                    valid = False
-                    print("Try again, instance not present in this account.  "
-                          "Try again checking for typos.")
-        else:
-            res = self.db_services.validate_instance_id(instance_id)
-            if res is not True:
-                print("*** Error, instance name either not valid.  Try again " 
-                     "checking for typos.")
-                return
-            if instance_id not in instance_list:
-                print("*** Error, This instance not present in this account.  "
-                     "Try again checking for typos.  Run `db aws_list_instances` to "
-                     "see valid list.")
-                return
-
-        user_input = raw_input(
-            "Deleting an instance will erase all your data associated with the "
-            "database in that instance.  Really quit? y or n:"
-        )
-        if user_input == 'y':
-            res = self.db_services.delete_db_instance(instance_id)
-            if res:
-                print("AWS RDS database instance %s deleted.  Run `db " \
-                    "aws_list_instances` for current status." % instance_id)
-            else:
-                print("*** Error deleting database instance %s.  " \
-                    "It maybe because it is still being created, deleted, or is " \
-                    "being backed up.  Run `db aws_list_instances` for current " \
-                    "status." % instance_id)
-        else:
-            return
-
-    def db_use_aws_instance(self, instance_id, arg):
-        ''' set your database info to use the current instance configure a
-        security zone for this based on your ip '''
-        interactive = False
-        if instance_id is None:
-            interactive = True
-
-        instances = self.db_services.get_db_instances()
-        instance_list = [dbinst.id for dbinst in instances]
-
-        if len(instances) == 0:
-            print("There are no instances in this region/account.  Use `db "
-                "aws_create_instance` to make one first.")
-            return
-
-        # show list of available instances, if there are none cancel immediately
-        if interactive:
-            valid = False
-            print("Here are the available instances you have.  You can only "
-                "use those listed as 'available':")
-            for inst in instances:
-                print "\t ", inst.id, "(", inst.status, ")"
-            while not valid:
-                instance_id = raw_input('Enter the instance identity you would '
-                                        'like to use: ')
-                res = self.db_services.validate_instance_id(instance_id)
-                if res is True:
-                    valid = True
-                else:
-                    print(res + " Try again, instance name not valid.  Check "
-                          "for typos.")
-                if instance_id in instance_list:
-                    valid = True
-                else:
-                    valid = False
-                    print("Try again, instance not present in this account. "
-                          "Try again checking for typos.")
-        else:
-            res = self.db_services.validate_instance_id(instance_id)
-            if res != True:
-                print("*** Error, instance name either not valid.  Try again "
-                      "checking for typos.")
-                return
-            if instance_id not in instance_list:
-                print("*** Error, This instance not present in this account. "
-                      "Try again checking for typos.  Run `db aws_list_instances` to "
-                      "see valid list.")
-                return
-
-        user_input = raw_input(
-            "Switching your DB settings to use this instance. Are you sure you "
-            "want to do this? "
-        )
-        if user_input == 'y':
-            # ask for password
-            valid = False
-            while not valid:
-                password = raw_input('enter the master password for this '
-                                     'instance: ')
-                res = self.db_services.validate_instance_password(password)
-                if res != True:
-                    print("*** Error: password seems incorrect, doesn't "
-                          "conform to AWS rules.  Try again")
-                else:
-                    valid = True
-
-            # Get instance
-            myinstance = self.db_services.get_db_instance_info(instance_id)
-            if myinstance:
-                # Add security zone to this node to allow connections
-                my_ip = self.web_services.get_my_ip()
-                if (not self.db_services.allow_access_to_instance(myinstance,
-                                                                  my_ip)):
-                    print("*** Error authorizing your ip address to connect to " \
-                          "server (%s)." % my_ip)
-                    return
-                print "AWS RDS database instance %s selected." % instance_id
-
-                # Using regular SQL commands list available database on this
-                # node
-                try:
-                    db_url = 'mysql://' + myinstance.master_username + ":" \
-                        + password + "@" + myinstance.endpoint[0] + ":" + \
-                        str(myinstance.endpoint[1])
-                    engine = sa.create_engine(db_url, echo=False)
-                    eng = engine.connect().execute
-                    db_names = eng("show databases").fetchall()
-                except:
-                    print("***  Error connecting to instance.  Your password "
-                          "might be incorrect.")
-                    return
-                existing_dbs = [db[0] for db in db_names if db not in \
-                                [('information_schema',), ('innodb',), \
-                                 ('mysql',), ('performance_schema',)]]
-                create_db = False
-                if len(existing_dbs) == 0:
-                    valid = False
-                    while not valid:
-                        db_name = raw_input("No existing DBs in this instance. "
-                                            "Enter a new name to create one: ")
-                        res = self.db_services.validate_instance_dbname(db_name)
-                        if res is True:
-                            valid = True
-                        else:
-                            print res + " Try again."
-                    create_db = True
-                else:
-                    print "Here are the available database tables"
-                    for database in existing_dbs:
-                        print "\t" + database
-                    valid = False
-                    while not valid:
-                        db_name = raw_input(
-                            "Enter the name of the database you want to use or "
-                            "a new name to create  a new one: "
-                        )
-                        res = self.db_services.validate_instance_dbname(db_name)
-                        if res is True:
-                            valid = True
-                        else:
-                            print res + " Try again."
-                    if db_name not in existing_dbs:
-                        create_db = True
-                if create_db:
-                    try:
-                        connection.execute("CREATE DATABASE %s;" % db_name)
-                    except:
-                        print("*** Error creating database %s on instance " \
-                              "%s" % (db_name, instance_id))
-                        return
-                base_url = 'mysql://' + myinstance.master_username + ":" + \
-                    password + "@" + myinstance.endpoint[0] + ":" + \
-                    str(myinstance.endpoint[1]) + "/" + db_name
-                self.config.set("Database Parameters", "database_url", base_url)
-                print("Successfully set your current database (database_url) " \
-                      "to \n\t%s" % base_url)
-                if (self.server.is_server_running() == 'maybe' or
-                        self.server.is_server_running() == 'yes'):
-                    self.do_restart_server('')
-            else:
-                print '\n'.join([
-                    "*** Error selecting database instance %s." % arg['<id>'],
-                    "Run `db list_db_instances` for current status of instances, only `available`",
-                    "instances can be used.  Also, your password may be incorrect."
-                ])
-        else:
-            return
-
-
-    def db_create_aws_db_instance(self, instid=None, size=None, username=None,
-                                  password=None, dbname=None):
-        ''' Create db instance on AWS '''
-        interactive = False
-        if instid is None:
-            interactive = True
-
-        if interactive:
-            print '\n'.join(['*************************************************',
-                             'Ok, here are the rules on creating instances:',
-                             '',
-                             'instance id:',
-                             '  Each instance needs an identifier.  This is the name',
-                             '  of the virtual machine created for you on AWS.',
-                             '  Rules are 1-63 alphanumeric characters, first must',
-                             '  be a letter, must be unique to this AWS account.',
-                             '',
-                             'size:',
-                             '  The maximum size of you database in GB.  Enter an',
-                             '  integer between 5-1024',
-                             '',
-                             'master username:',
-                             '  The username you will use to connect.  Rules are',
-                             '  1-16 alphanumeric characters, first must be a letter,',
-                             '  cannot be a reserved MySQL word/phrase',
-                             '',
-                             'master password:',
-                             '  Rules are 8-41 alphanumeric characters',
-                             '',
-                             'database name:',
-                             '  The name for the first database on this instance.  Rules are',
-                             '  1-64 alphanumeric characters, cannot be a reserved MySQL word',
-                             '*************************************************',
-                             ''])
-
-        if interactive:
-            valid = False
-            while not valid:
-                instid = raw_input('enter an identifier for the instance (see '
-                                   'rules above): ')
-                res = self.db_services.validate_instance_id(instid)
-                if res is True:
-                    valid = True
-                else:
-                    print res + " Try again."
-        else:
-            res = self.db_services.validate_instance_id(instid)
-            if res is not True:
-                print res
-                return
-
-        if interactive:
-            valid = False
-            while not valid:
-                size = raw_input('size of db in GB (5-1024): ')
-                res = self.db_services.validate_instance_size(size)
-                if res is True:
-                    valid = True
-                else:
-                    print res + " Try again."
-        else:
-            res = self.db_services.validate_instance_size(size)
-            if res is not True:
-                print res
-                return
-
-        if interactive:
-            valid = False
-            while not valid:
-                username = raw_input('master username (see rules above): ')
-                res = self.db_services.validate_instance_username(username)
-                if res is True:
-                    valid = True
-                else:
-                    print res + " Try again."
-        else:
-            res = self.db_services.validate_instance_username(username)
-            if res is not True:
-                print res
-                return
-
-        if interactive:
-            valid = False
-            while not valid:
-                password = raw_input('master password (see rules above): ')
-                res = self.db_services.validate_instance_password(password)
-                if res is True:
-                    valid = True
-                else:
-                    print res + " Try again."
-        else:
-            res = self.db_services.validate_instance_password(password)
-            if res is not True:
-                print res
-                return
-
-        if interactive:
-            valid = False
-            while not valid:
-                dbname = raw_input('name for first database on this instance \
-                                   (see rules): ')
-                res = self.db_services.validate_instance_dbname(dbname)
-                if res is True:
-                    valid = True
-                else:
-                    print res + " Try again."
-        else:
-            res = self.db_services.validate_instance_dbname(dbname)
-            if res is not True:
-                print res
-                return
-
-        options = {
-            'id': instid,
-            'size': size,
-            'username': username,
-            'password': password,
-            'dbname': dbname
-        }
-        instance = self.db_services.create_db_instance(options)
-        if not instance:
-            print '\n'.join(['*****************************',
-                             '  Sorry, there was an error creating db instance.'])
-        else:
-            print '\n'.join(['*****************************',
-                             '  Creating AWS RDS MySQL Instance',
-                             '    id: ' + str(options['id']),
-                             '    size: ' + str(options['size']) + " GB",
-                             '    username: ' + str(options['username']),
-                             '    password: ' + str(options['password']),
-                             '    dbname: ' +  str(options['dbname']),
-                             '    type: MySQL/db.t1.micro',
-                             '    ________________________',
-                             ' Be sure to store this information in a safe place.',
-                             ' Please wait 5-10 minutes while your database is created in the cloud.',
-                             ' You can run \'db aws_list_instances\' to verify it was created (status',
-                             ' will say \'available\' when it is ready'])
-
-
     # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
     #   Basic shell commands
     # +-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.+-+.
@@ -1621,14 +945,12 @@ class PsiturkNetworkShell(PsiturkShell):
             else:
                 arg['<which>'] = 'sandbox'
         if arg['<which>'] == 'live':
-            self.sandbox = False
-            self.amt_services.set_sandbox(False)
-            self.tally_hits()
+            self.set_sandbox(False)
+            self.update_hit_tally()
             print 'Entered %s mode' % colorize('live', 'bold')
         else:
-            self.sandbox = True
-            self.amt_services.set_sandbox(True)
-            self.tally_hits()
+            self.set_sandbox(True)
+            self.update_hit_tally()
             print 'Entered %s mode' % colorize('sandbox', 'bold')
         if restart_server:
             self.server_restart()
@@ -1636,7 +958,11 @@ class PsiturkNetworkShell(PsiturkShell):
         ''' Help '''
         with open(self.help_path + 'mode.txt', 'r') as help_text:
             print help_text.read()
-
+    
+    def set_sandbox(self, is_sandbox):
+        self.sandbox = is_sandbox
+        self.amt_services_wrapper.set_sandbox(is_sandbox)
+            
     @docopt_cmd
     def do_tunnel(self, arg):
         """
@@ -1663,21 +989,24 @@ class PsiturkNetworkShell(PsiturkShell):
           hit extend <HITid> [(--assignments <number>)] [(--expiration <minutes>)]
           hit expire (--all | <HITid> ...)
           hit dispose (--all | <HITid> ...)
-          hit list [--active | --reviewable]
+          hit list [--active | --reviewable] [--all-studies]
           hit help
         """
 
         if arg['create']:
             self.hit_create(arg['<numWorkers>'], arg['<reward>'],
                             arg['<duration>'])
+            self.update_hit_tally()
         elif arg['extend']:
-            self.hit_extend(arg['<HITid>'], arg['<number>'], arg['<minutes>'])
+            self.amt_services_wrapper.hit_extend(arg['<HITid>'], arg['<number>'], arg['<minutes>'])
         elif arg['expire']:
-            self.hit_expire(arg['--all'], arg['<HITid>'])
+            self.amt_services_wrapper.hit_expire(arg['--all'], arg['<HITid>'])
+            self.update_hit_tally()
         elif arg['dispose']:
-            self.hit_dispose(arg['--all'], arg['<HITid>'])
+            self.amt_services_wrapper.hit_dispose(arg['--all'], arg['<HITid>'])
+            self.update_hit_tally()
         elif arg['list']:
-            self.hit_list(arg['--active'], arg['--reviewable'])
+            self.hit_list(arg['--active'], arg['--reviewable'], arg['--all-studies'])
         else:
             self.help_hit()
 
@@ -1698,25 +1027,24 @@ class PsiturkNetworkShell(PsiturkShell):
     def do_worker(self, arg):
         """
         Usage:
-          worker approve (--hit <hit_id> | <assignment_id> ...)
+          worker approve (--all | --hit <hit_id> ... | <assignment_id> ...) [--all-studies] [--force]
           worker reject (--hit <hit_id> | <assignment_id> ...)
           worker unreject (--hit <hit_id> | <assignment_id> ...)
           worker bonus  (--amount <amount> | --auto) (--hit <hit_id> | <assignment_id> ...)
-          worker list [--submitted | --approved | --rejected] [(--hit <hit_id>)]
+          worker list [--submitted | --approved | --rejected] [(--hit <hit_id>)] [--all-studies]
           worker help
         """
         if arg['approve']:
-            self.worker_approve(arg['<hit_id>'], arg['<assignment_id>'])
+            self.worker_approve(arg['--all'], arg['<hit_id>'], arg['<assignment_id>'], arg['--all-studies'], arg['--force'])
         elif arg['reject']:
-            self.worker_reject(arg['<hit_id>'], arg['<assignment_id>'])
+            self.amt_services_wrapper.worker_reject(arg['<hit_id>'], arg['<assignment_id>'])
         elif arg['unreject']:
-            self.worker_unreject(arg['<hit_id>'], arg['<assignment_id>'])
+            self.amt_services_wrapper.worker_unreject(arg['<hit_id>'], arg['<assignment_id>'])
         elif arg['list']:
-            self.worker_list(arg['--submitted'], arg['--approved'],
-                             arg['--rejected'], arg['<hit_id>'])
+            self.worker_list(arg['--submitted'], arg['--approved'], arg['--rejected'], arg['<hit_id>'], arg['--all-studies'])
         elif arg['bonus']:
-            self.worker_bonus(arg['<hit_id>'], arg['--auto'], arg['<amount>'],
-                              "", arg['<assignment_id>'])
+            self.amt_services_wrapper.worker_bonus(arg['<hit_id>'], arg['--auto'], arg['<amount>'], '',
+                              arg['<assignment_id>'])
         else:
             self.help_worker()
 
@@ -1740,23 +1068,30 @@ class PsiturkNetworkShell(PsiturkShell):
         -p, --print-only        just provides the URL, doesn't attempt to
                                 launch browser
         """
-        if (self.server.is_server_running() == 'no' or
-                self.server.is_server_running() == 'maybe'):
-            print("Error: Sorry, you need to have the server running to debug "
-                  "your experiment.  Try 'server on' first.")
-            return
+        revproxy_url = False
+        if self.config.has_option('Server Parameters','adserver_revproxy_host'):
+            if self.config.has_option( 'Server Parameters', 'adserver_revproxy_port'):
+                port = self.config.get( 'Server Parameters', 'adserver_revproxy_port')
+            else:
+                port = 80
+            revproxy_url = "http://{}:{}/ad".format(self.config.get('Server Parameters', 
+                                                                    'adserver_revproxy_host'),
+                                                    port)
 
-        if 'OPENSHIFT_SECRET_TOKEN' in os.environ:
-            base_url = "http://" + self.config.get('Server Parameters',
-                                                   'host') + "/ad"
+        if revproxy_url:
+            base_url = revproxy_url
+        elif 'OPENSHIFT_SECRET_TOKEN' in os.environ:
+            base_url = "http://" + self.config.get('Server Parameters', 'host') + "/ad"
         else:
-            base_url = "http://" + self.config.get('Server Parameters',
+            if arg['--print-only']:
+                my_ip = get_my_ip()
+                base_url = "http://" + my_ip + ":" + \
+                    self.config.get('Server Parameters', 'port') + "/ad"
+            else:
+                base_url = "http://" + self.config.get('Server Parameters',
                                                    'host') + \
                 ":" + self.config.get('Server Parameters', 'port') + "/ad"
 
-        my_ip = self.web_services.get_my_ip()
-        remote_url = "http://" + my_ip + ":" + \
-            self.config.get('Server Parameters', 'port') + "/ad"
 
         launch_url = base_url + "?assignmentId=debug" + \
             str(self.random_id_generator()) \
@@ -1764,15 +1099,9 @@ class PsiturkNetworkShell(PsiturkShell):
             + "&workerId=debug" + str(self.random_id_generator() \
             + "&mode=debug")
 
-        remote_launch_url = remote_url + "?assignmentId=debug" + \
-            str(self.random_id_generator()) \
-            + "&hitId=debug" + str(self.random_id_generator()) \
-            + "&workerId=debug" + str(self.random_id_generator() \
-            + "&mode=debug")
-
         if arg['--print-only']:
             print("Here's your randomized debug link, feel free to request " \
-                  "another:\n\t" + remote_launch_url)
+                  "another:\n\t" + launch_url)
 
         else:
             print("Launching browser pointed at your randomized debug link, " \
@@ -1883,21 +1212,10 @@ def run(cabinmode=False, script=None, execute=None, quiet=False):
         shell = PsiturkShell(config, server)
         shell.check_offline_configuration()
     else:
-        amt_services = MTurkServices(
-            config.get('AWS Access', 'aws_access_key_id'), \
-            config.get('AWS Access', 'aws_secret_access_key'),
-            config.getboolean('Shell Parameters', 'launch_in_sandbox_mode'))
-        aws_rds_services = RDSServices(
-            config.get('AWS Access', 'aws_access_key_id'), \
-            config.get('AWS Access', 'aws_secret_access_key'),
-            config.get('AWS Access', 'aws_region'),
-            quiet=quiet)
-        web_services = PsiturkOrgServices(
-            config.get('psiTurk Access', 'psiturk_access_key_id'),
-            config.get('psiTurk Access', 'psiturk_secret_access_id'))
         shell = PsiturkNetworkShell(
-            config, amt_services, aws_rds_services, web_services, server, \
-            config.getboolean('Shell Parameters', 'launch_in_sandbox_mode'), quiet=quiet)
+            config, server, \
+            config.getboolean('Shell Parameters', 'launch_in_sandbox_mode'), 
+            quiet=quiet)
 
     if script:
         with open(script, 'r') as temp_file:

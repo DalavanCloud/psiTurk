@@ -11,20 +11,23 @@ your task.  An example looks like this:
 	num_conds = 1
 	num_counters = 1
 
+
 `experiment_code_version`  [ string ]
------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Often you might run a couple different versions
 of an experiment during a research project (e.g.,
-Experiment 1 and 2 of a paper).  
+Experiment 1 and 2 of a paper).
 `experiment_code_version` is a string which is written into
 the database along with your data helping you remember which
-version of the code each participant was given. 
+version of the code each participant was given.
 
-This variable is used by the server along with `num_conds` and `num_counters` to ensure an equal number of workers per condition for the current `experiment_code_version`. In other words, changing the experiment_code_version resets the number of workers per condition to [0 0].  
+This variable is used by the server along with `num_conds` and `num_counters` to ensure an equal number of workers per condition for the current `experiment_code_version`. In other words, changing the experiment_code_version resets the number of workers per condition to [0 0].
 
 
 `num_conds`  [ integer ]
----------------------
+~~~~~~~~~~~~~~~~~~~~~~~~
+
 **psiTurk** includes a primitive system for counterbalancing
 participants to conditions.  If you specify a number of
 condition greater than 1, then **psiTurk** will attempt to
@@ -33,14 +36,16 @@ with equal N.  It also takes into account the time delay
 between a person being assigned to a condition and completing
 a condition (or possibly withdrawing).  Thus, you can be
 fairly assured that after running 100 subjects in two conditions
-each condition will have 50+/- completed participants. 
+each condition will have 50+/- completed participants.
 
-.. warning::
-    
-    It is very important to change the `experiment_code_version` when changing the `num_conds` or the `num_counters` variable in config.txt, because **PsiTurk** will consider all the workers run *with the same code version* when deciding which condition to assign a new worker. In other words, if `num_conds` changes from 4 to 2 without changing `experiment_code_version`, **PsiTurk** will still assign 4 conditions instead of 2 because there will be 4 conditions present in participants.db that were run with the same code version.    
+.. note::
+
+    If you want to reset the random assignment when changing `num_conds`, update the `experiment_code_version`.
+
 
 `num_counters`  [ integer ]
--------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 `num_counters` is identical to `num_cond` but provides
 an additional counterbalancing factor beyond condition.
 If `num_counters` is greater than 1 then **psiTurk**
